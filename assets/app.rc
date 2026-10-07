@@ -1,0 +1,2 @@
+// アプリアイコン（scripts/make-icon.py で生成）。ID 1 は sys::set_window_icon から読み込む
+1 ICON "icon.ico"

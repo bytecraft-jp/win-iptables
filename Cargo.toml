@@ -1,0 +1,40 @@
+[package]
+name = "win-iptables"
+version = "0.1.0"
+edition = "2024"
+description = "Windows native lightweight user-mode router (Wintun + iptables-style rules)"
+
+[dependencies]
+anyhow = "1.0.104"
+eframe = { version = "0.36.2", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
+egui_extras = { version = "0.36.2", default-features = false }
+etherparse = "0.20.3"
+ipnet = "2.12.2"
+ipstack = "1.0.1"
+parking_lot = "0.12.5"
+socket2 = { version = "0.6.5", features = ["all"] }
+tokio = { version = "1.53.2", features = ["full"] }
+wintun-bindings = "0.7.40"
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+arc-swap = "1.9.2"
+raw-window-handle = "0.6"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+
+[build-dependencies]
+embed-resource = "3.0.11"
