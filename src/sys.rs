@@ -16,9 +16,7 @@ pub fn relaunch_as_admin() -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
     let verb = wide("runas".as_ref());
     let file = wide(exe.as_os_str());
-    let r = unsafe {
-        ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL)
-    };
+    let r = unsafe { ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL) };
     // 32 以下はエラー（ユーザーが UAC をキャンセルした場合も含む）
     if r as isize > 32 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
 }

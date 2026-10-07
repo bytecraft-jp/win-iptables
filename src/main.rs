@@ -3,6 +3,7 @@
 mod config;
 mod engine;
 mod gui;
+mod hotspot;
 mod icmp;
 mod ics;
 mod pacer;

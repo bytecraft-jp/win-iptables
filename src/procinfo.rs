@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ptr;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -36,8 +37,20 @@ fn fetch_table<R: Copy>(call: impl Fn(*mut core::ffi::c_void, *mut u32) -> u32) 
     Vec::new()
 }
 
+fn tcp_table<R: Copy>(af: u16) -> Vec<R> {
+    fetch_table(|p, s| unsafe { GetExtendedTcpTable(p, s, 0, af as u32, TCP_TABLE_OWNER_PID_ALL, 0) })
+}
+
+fn udp_table<R: Copy>(af: u16) -> Vec<R> {
+    fetch_table(|p, s| unsafe { GetExtendedUdpTable(p, s, 0, af as u32, UDP_TABLE_OWNER_PID, 0) })
+}
+
 fn port_of(p: u32) -> u16 {
     u16::from_be(p as u16)
+}
+
+fn v4(addr: u32) -> IpAddr {
+    Ipv4Addr::from(addr.to_ne_bytes()).into()
 }
 
 /// 接続テーブル 1 回分のスナップショット（ローカルポート → (ローカルアドレス, PID)）
@@ -53,26 +66,18 @@ impl Table {
         let mut rows: HashMap<u16, Vec<(IpAddr, u32)>> = HashMap::new();
         let mut push = |port: u32, addr: IpAddr, pid: u32| rows.entry(port_of(port)).or_default().push((addr, pid));
         match (proto, v6) {
-            (Proto::Tcp, false) => fetch_table::<MIB_TCPROW_OWNER_PID>(|p, s| unsafe {
-                GetExtendedTcpTable(p, s, 0, AF_INET as u32, TCP_TABLE_OWNER_PID_ALL, 0)
-            })
-            .iter()
-            .for_each(|r| push(r.dwLocalPort, Ipv4Addr::from(r.dwLocalAddr.to_ne_bytes()).into(), r.dwOwningPid)),
-            (Proto::Tcp, true) => fetch_table::<MIB_TCP6ROW_OWNER_PID>(|p, s| unsafe {
-                GetExtendedTcpTable(p, s, 0, AF_INET6 as u32, TCP_TABLE_OWNER_PID_ALL, 0)
-            })
-            .iter()
-            .for_each(|r| push(r.dwLocalPort, Ipv6Addr::from(r.ucLocalAddr).into(), r.dwOwningPid)),
-            (Proto::Udp, false) => fetch_table::<MIB_UDPROW_OWNER_PID>(|p, s| unsafe {
-                GetExtendedUdpTable(p, s, 0, AF_INET as u32, UDP_TABLE_OWNER_PID, 0)
-            })
-            .iter()
-            .for_each(|r| push(r.dwLocalPort, Ipv4Addr::from(r.dwLocalAddr.to_ne_bytes()).into(), r.dwOwningPid)),
-            (Proto::Udp, true) => fetch_table::<MIB_UDP6ROW_OWNER_PID>(|p, s| unsafe {
-                GetExtendedUdpTable(p, s, 0, AF_INET6 as u32, UDP_TABLE_OWNER_PID, 0)
-            })
-            .iter()
-            .for_each(|r| push(r.dwLocalPort, Ipv6Addr::from(r.ucLocalAddr).into(), r.dwOwningPid)),
+            (Proto::Tcp, false) => {
+                tcp_table::<MIB_TCPROW_OWNER_PID>(AF_INET).iter().for_each(|r| push(r.dwLocalPort, v4(r.dwLocalAddr), r.dwOwningPid))
+            }
+            (Proto::Tcp, true) => tcp_table::<MIB_TCP6ROW_OWNER_PID>(AF_INET6)
+                .iter()
+                .for_each(|r| push(r.dwLocalPort, Ipv6Addr::from(r.ucLocalAddr).into(), r.dwOwningPid)),
+            (Proto::Udp, false) => {
+                udp_table::<MIB_UDPROW_OWNER_PID>(AF_INET).iter().for_each(|r| push(r.dwLocalPort, v4(r.dwLocalAddr), r.dwOwningPid))
+            }
+            (Proto::Udp, true) => udp_table::<MIB_UDP6ROW_OWNER_PID>(AF_INET6)
+                .iter()
+                .for_each(|r| push(r.dwLocalPort, Ipv6Addr::from(r.ucLocalAddr).into(), r.dwOwningPid)),
             (Proto::Icmp, _) => {}
         }
         Self { at, rows }
@@ -122,44 +127,37 @@ pub fn owner_pid_since(proto: Proto, local: SocketAddr, since: Instant) -> Optio
 const MIB_TCP_STATE_LISTEN: u32 = 2;
 const LISTENER_TTL: Duration = Duration::from_secs(2);
 
-static LISTENER_CACHE: Mutex<Option<HashMap<(bool, u16), (Option<u32>, Instant)>>> = Mutex::new(None);
+type ListenerCache = HashMap<(bool, u16), (Option<u32>, Instant)>;
+static LISTENER_CACHE: LazyLock<Mutex<ListenerCache>> = LazyLock::new(Default::default);
 
 /// ローカルで `port` を待ち受けているプロセスの PID（TCP は LISTEN、UDP は bind 中）。
 /// DNAT 先のプロキシ自身の通信を見分けるのに使う。接続ごとに呼ばれるので短時間キャッシュする
 pub fn listener_pid(proto: Proto, port: u16) -> Option<u32> {
     let tcp = proto == Proto::Tcp;
     let key = (tcp, port);
-    if let Some((pid, at)) = LISTENER_CACHE.lock().get_or_insert_with(HashMap::new).get(&key)
+    if let Some((pid, at)) = LISTENER_CACHE.lock().get(&key)
         && at.elapsed() < LISTENER_TTL
     {
         return *pid;
     }
     let pid = if tcp {
-        let v4 = fetch_table::<MIB_TCPROW_OWNER_PID>(|p, s| unsafe {
-            GetExtendedTcpTable(p, s, 0, AF_INET as u32, TCP_TABLE_OWNER_PID_ALL, 0)
-        });
-        let v6 = || {
-            fetch_table::<MIB_TCP6ROW_OWNER_PID>(|p, s| unsafe {
-                GetExtendedTcpTable(p, s, 0, AF_INET6 as u32, TCP_TABLE_OWNER_PID_ALL, 0)
-            })
-        };
-        v4.iter()
-            .find(|r| r.dwState == MIB_TCP_STATE_LISTEN && port_of(r.dwLocalPort) == port)
-            .map(|r| r.dwOwningPid)
-            .or_else(|| {
-                v6().iter().find(|r| r.dwState == MIB_TCP_STATE_LISTEN && port_of(r.dwLocalPort) == port).map(|r| r.dwOwningPid)
-            })
+        let listening = |state: u32, local_port: u32| state == MIB_TCP_STATE_LISTEN && port_of(local_port) == port;
+        tcp_table::<MIB_TCPROW_OWNER_PID>(AF_INET).iter().find(|r| listening(r.dwState, r.dwLocalPort)).map(|r| r.dwOwningPid).or_else(
+            || tcp_table::<MIB_TCP6ROW_OWNER_PID>(AF_INET6).iter().find(|r| listening(r.dwState, r.dwLocalPort)).map(|r| r.dwOwningPid),
+        )
     } else {
         owner_pid(Proto::Udp, SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port))
             .or_else(|| owner_pid(Proto::Udp, SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port)))
     };
-    LISTENER_CACHE.lock().get_or_insert_with(HashMap::new).insert(key, (pid, Instant::now()));
+    LISTENER_CACHE.lock().insert(key, (pid, Instant::now()));
     pid
 }
 
 const CACHE_TTL: Duration = Duration::from_secs(30);
 
-static NAME_CACHE: Mutex<Option<HashMap<u32, (String, Instant)>>> = Mutex::new(None);
+const NAME_CACHE_MAX: usize = 4096;
+
+static NAME_CACHE: LazyLock<Mutex<HashMap<u32, (String, Instant)>>> = LazyLock::new(Default::default);
 
 /// PID から小文字の実行ファイル名（例: "chrome.exe"）を得る
 pub fn process_name(pid: u32) -> Option<String> {
@@ -168,15 +166,14 @@ pub fn process_name(pid: u32) -> Option<String> {
         4 => return Some("system".into()),
         _ => {}
     }
-    let mut cache = NAME_CACHE.lock();
-    let map = cache.get_or_insert_with(HashMap::new);
+    let mut map = NAME_CACHE.lock();
     if let Some((name, at)) = map.get(&pid)
         && at.elapsed() < CACHE_TTL
     {
         return Some(name.clone());
     }
     let name = query_image_name(pid)?;
-    if map.len() > 4096 {
+    if map.len() > NAME_CACHE_MAX {
         map.retain(|_, (_, at)| at.elapsed() < CACHE_TTL);
     }
     map.insert(pid, (name.clone(), Instant::now()));

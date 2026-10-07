@@ -3157,6 +3157,7 @@ dependencies = [
  "raw-window-handle",
  "socket2",
  "tokio",
+ "windows",
  "windows-sys 0.61.2",
  "wintun-bindings",
 ]

@@ -6,12 +6,16 @@
 //! -A OUTPUT -p tcp -d 10.0.0.0/8 --dport 443 -j ROUTE -o Ethernet
 //! -A OUTPUT -p udp --dport 443 -j DROP             # QUIC を遮断
 //! -A OUTPUT -p tcp --dport 80,443 -j REDIRECT --to-ports 8080   # ローカルのプロキシへ
-//! -A OUTPUT -s 192.168.137.50 -j ROUTE -o "Wi-Fi"  # 特定の端末（ICS 配下など）の通信
+//! -A OUTPUT ! -m owner --process * -j ROUTE -o "Wi-Fi"  # プロセスのない通信（ホットスポットの端末など）
 //! -A BYPASS -d 192.168.100.0/24 -o Ethernet        # TUN を通さずカーネル経路で直送
 //! ```
 
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
+
+pub mod examples;
+mod parser;
+pub use parser::{parse, parse_cidr};
 
 use ipnet::IpNet;
 
@@ -42,7 +46,11 @@ pub enum Target {
     Reject,
     /// 宛先を書き換えて接続する。`port` が None なら元の宛先ポートのまま。
     /// `oif` 指定時はそのNICから、未指定なら OS の経路表に従って接続する
-    Dnat { addr: IpAddr, port: Option<u16>, oif: Option<String> },
+    Dnat {
+        addr: IpAddr,
+        port: Option<u16>,
+        oif: Option<String>,
+    },
 }
 
 impl Target {
@@ -184,6 +192,23 @@ impl RuleSet {
         Some(Verdict { rule: None, target })
     }
 
+    /// この PC 上の転送先（REDIRECT など）のポート（重複なし）。待ち受けがなければ該当する通信はすべて失敗する
+    pub fn local_dnat_ports(&self) -> Vec<u16> {
+        let mut v: Vec<u16> = self
+            .rules
+            .iter()
+            .map(|r| &r.target)
+            .chain(std::iter::once(&self.policy))
+            .filter_map(|t| match t {
+                Target::Dnat { addr, port: Some(p), .. } if addr.is_loopback() => Some(*p),
+                _ => None,
+            })
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
     /// ルールが参照しているインターフェース名（重複なし）
     pub fn referenced_interfaces(&self) -> Vec<&str> {
         let mut v: Vec<&str> = Vec::new();
@@ -274,300 +299,6 @@ fn wildcard(pat: &str, s: &str) -> bool {
     p[pi..].iter().all(|&c| c == b'*')
 }
 
-/// 引用符と `#` コメントを考慮して1行をトークンに分割する
-fn tokenize(line: &str) -> Result<Vec<String>, String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut in_token = false;
-    let mut quote: Option<char> = None;
-    for c in line.chars() {
-        match quote {
-            Some(q) if c == q => quote = None,
-            Some(_) => cur.push(c),
-            None => match c {
-                '"' | '\'' => {
-                    quote = Some(c);
-                    in_token = true;
-                }
-                '#' => break,
-                c if c.is_whitespace() => {
-                    if in_token {
-                        out.push(std::mem::take(&mut cur));
-                        in_token = false;
-                    }
-                }
-                c => {
-                    cur.push(c);
-                    in_token = true;
-                }
-            },
-        }
-    }
-    if quote.is_some() {
-        return Err("引用符が閉じていません".into());
-    }
-    if in_token {
-        out.push(cur);
-    }
-    Ok(out)
-}
-
-fn parse_net(s: &str) -> Result<IpNet, String> {
-    if s.eq_ignore_ascii_case("any") {
-        return Ok("0.0.0.0/0".parse().unwrap());
-    }
-    if let Ok(n) = s.parse::<IpNet>() {
-        return Ok(n.trunc());
-    }
-    s.parse::<IpAddr>().map(IpNet::from).map_err(|_| format!("不正なアドレス/CIDR: {s}"))
-}
-
-fn parse_port(s: &str) -> Result<u16, String> {
-    s.parse().map_err(|_| format!("不正なポート番号: {s}"))
-}
-
-fn parse_ports(s: &str) -> Result<Vec<PortRange>, String> {
-    s.split(',')
-        .map(|p| match p.split_once(':').or_else(|| p.split_once('-')) {
-            Some((a, b)) => {
-                let (a, b) = (parse_port(a)?, parse_port(b)?);
-                if a > b {
-                    return Err(format!("ポート範囲が逆順です: {p}"));
-                }
-                Ok(PortRange(a, b))
-            }
-            None => parse_port(p).map(|n| PortRange(n, n)),
-        })
-        .collect()
-}
-
-fn parse_proto(s: &str) -> Result<Option<Proto>, String> {
-    Ok(match s.to_ascii_lowercase().as_str() {
-        "tcp" => Some(Proto::Tcp),
-        "udp" => Some(Proto::Udp),
-        "icmp" | "icmpv6" | "ipv6-icmp" => Some(Proto::Icmp),
-        "all" | "any" => None,
-        _ => return Err(format!("未対応のプロトコル: {s}")),
-    })
-}
-
-#[derive(PartialEq)]
-enum Chain {
-    Output,
-    Bypass,
-}
-
-pub fn parse(text: &str) -> Result<RuleSet, Vec<ParseError>> {
-    let mut rs = RuleSet::default();
-    let mut errors = Vec::new();
-    for (i, raw) in text.lines().enumerate() {
-        let line = i + 1;
-        if let Err(msg) = parse_line(raw, line, &mut rs) {
-            errors.push(ParseError { line, msg });
-        }
-    }
-    if errors.is_empty() { Ok(rs) } else { Err(errors) }
-}
-
-fn parse_line(raw: &str, line: usize, rs: &mut RuleSet) -> Result<(), String> {
-    let toks = tokenize(raw)?;
-    let Some(cmd) = toks.first() else { return Ok(()) };
-    let mut it = toks[1..].iter().map(String::as_str);
-
-    let (insert, chain) = match cmd.as_str() {
-        "-A" | "-I" | "-P" => {
-            let chain = match take(&mut it, cmd)?.to_ascii_uppercase().as_str() {
-                "OUTPUT" => Chain::Output,
-                "BYPASS" if cmd != "-P" => Chain::Bypass,
-                c => return Err(format!("未対応のチェイン: {c}")),
-            };
-            (cmd == "-I", chain)
-        }
-        c => return Err(format!("不明なコマンド: {c}（-A / -I / -P のいずれか）")),
-    };
-
-    if cmd == "-P" {
-        let target = take(&mut it, "-P")?.to_ascii_uppercase();
-        let mut opts = TargetOpts::default();
-        while let Some(t) = it.next() {
-            if !opts.parse(t, &mut it)? {
-                return Err(format!("-P で使えないオプション: {t}"));
-            }
-        }
-        rs.policy = make_target(&target, opts)?;
-        return Ok(());
-    }
-
-    let mut m = Match::default();
-    let mut target: Option<String> = None;
-    let mut opts = TargetOpts::default();
-    let mut gw: Option<IpAddr> = None;
-    let mut metric: Option<u32> = None;
-    let mut negate = false;
-
-    while let Some(t) = it.next() {
-        if t == "!" {
-            negate = true;
-            continue;
-        }
-        let mut val = || take(&mut it, t);
-        let neg = std::mem::take(&mut negate);
-        match t {
-            "-p" | "--protocol" => {
-                if let Some(p) = parse_proto(val()?)? {
-                    m.proto = Some(Cond { negate: neg, values: vec![p] });
-                }
-            }
-            "-s" | "--source" => {
-                let v = val()?.split(',').map(parse_net).collect::<Result<_, _>>()?;
-                m.src = Some(Cond { negate: neg, values: v });
-            }
-            "-d" | "--destination" => {
-                let v = val()?.split(',').map(parse_net).collect::<Result<_, _>>()?;
-                m.dst = Some(Cond { negate: neg, values: v });
-            }
-            "--dport" | "--dports" | "--destination-port" => {
-                m.dport = Some(Cond { negate: neg, values: parse_ports(val()?)? });
-            }
-            "--process" | "--proc" | "--cmd-owner" => {
-                let v = val()?.split(',').map(|s| s.trim().to_lowercase()).collect();
-                m.process = Some(Cond { negate: neg, values: v });
-            }
-            "-m" | "--match" => {
-                // owner / multiport などは iptables 互換のため読み捨てる。
-                // `! -m owner --process x` の ! は次の条件に引き継ぐ
-                val()?;
-                negate = neg;
-                continue;
-            }
-            "-j" | "--jump" => target = Some(val()?.to_ascii_uppercase()),
-            "--gw" | "--gateway" => {
-                let v = val()?;
-                gw = Some(v.parse().map_err(|_| format!("不正なゲートウェイ: {v}"))?);
-            }
-            "--metric" => {
-                let v = val()?;
-                metric = Some(v.parse().map_err(|_| format!("不正なメトリック: {v}"))?);
-            }
-            _ => {
-                if !opts.parse(t, &mut it)? {
-                    return Err(format!("不明なオプション: {t}"));
-                }
-            }
-        }
-        if neg && !matches!(t, "-p" | "--protocol" | "-s" | "--source" | "-d" | "--destination" | "--dport" | "--dports" | "--destination-port" | "--process" | "--proc" | "--cmd-owner") {
-            return Err(format!("{t} に ! は付けられません"));
-        }
-    }
-    if negate {
-        return Err("! の後にオプションがありません".into());
-    }
-
-    match chain {
-        Chain::Bypass => {
-            let dst = match &m.dst {
-                Some(c) if !c.negate && c.values.len() == 1 => c.values[0],
-                _ => return Err("BYPASS には単一の -d CIDR が必要です（! 不可）".into()),
-            };
-            if m.proto.is_some() || m.src.is_some() || m.dport.is_some() || m.process.is_some() || opts.to.is_some() {
-                return Err("BYPASS はカーネル経路なので -d と -o 以外の条件は使えません".into());
-            }
-            let oif = opts.oif.ok_or("BYPASS には -o インターフェースが必要です")?;
-            rs.bypass.push(BypassRoute { dst, oif, gw, metric });
-        }
-        Chain::Output => {
-            if gw.is_some() || metric.is_some() {
-                return Err("--gw / --metric は BYPASS チェイン専用です".into());
-            }
-            // -j 省略かつ -o 指定なら ROUTE とみなす
-            let target = match target {
-                Some(t) => make_target(&t, opts)?,
-                None if opts.oif.is_some() => make_target("ROUTE", opts)?,
-                None => return Err("-j ターゲットがありません".into()),
-            };
-            let rule = Rule { line, text: raw.trim().to_string(), m, target };
-            if insert {
-                rs.rules.insert(0, rule);
-            } else {
-                rs.rules.push(rule);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn take<'a>(it: &mut impl Iterator<Item = &'a str>, opt: &str) -> Result<&'a str, String> {
-    it.next().ok_or_else(|| format!("{opt} に値がありません"))
-}
-
-/// ターゲットに付くオプション（-o / --to-destination / --to-ports）
-#[derive(Default)]
-struct TargetOpts {
-    oif: Option<String>,
-    /// (アドレス, ポート)。REDIRECT はアドレス None（= 127.0.0.1）
-    to: Option<(Option<IpAddr>, Option<u16>)>,
-}
-
-impl TargetOpts {
-    /// ターゲット用オプションなら値を読んで true を返す
-    fn parse<'a>(&mut self, t: &str, it: &mut impl Iterator<Item = &'a str>) -> Result<bool, String> {
-        match t {
-            "-o" | "--oif" | "--out-interface" => self.oif = Some(take(it, t)?.to_string()),
-            "--to-destination" | "--to" => self.to = Some(parse_dest(take(it, t)?)?),
-            "--to-ports" | "--to-port" => {
-                let v = take(it, t)?;
-                if v.contains([',', ':', '-']) {
-                    return Err(format!("--to-ports は単一ポートのみ対応です: {v}"));
-                }
-                self.to = Some((None, Some(parse_port(v)?)));
-            }
-            _ => return Ok(false),
-        }
-        Ok(true)
-    }
-}
-
-/// `127.0.0.1:8080` / `127.0.0.1` / `[::1]:8080` / `::1`
-fn parse_dest(s: &str) -> Result<(Option<IpAddr>, Option<u16>), String> {
-    if let Ok(sa) = s.parse::<SocketAddr>() {
-        return Ok((Some(sa.ip()), Some(sa.port())));
-    }
-    let bare = s.trim_start_matches('[').trim_end_matches(']');
-    bare.parse::<IpAddr>().map(|a| (Some(a), None)).map_err(|_| format!("不正な転送先: {s}"))
-}
-
-fn make_target(name: &str, opts: TargetOpts) -> Result<Target, String> {
-    let TargetOpts { oif, to } = opts;
-    match name {
-        "DNAT" => {
-            let Some((Some(addr), port)) = to else {
-                return Err("DNAT には --to-destination ADDR[:PORT] が必要です".into());
-            };
-            return Ok(Target::Dnat { addr, port, oif });
-        }
-        "REDIRECT" => {
-            let Some((None, Some(port))) = to else {
-                return Err("REDIRECT には --to-ports PORT が必要です（アドレス指定は DNAT を使用）".into());
-            };
-            if oif.is_some() {
-                return Err("REDIRECT はローカル宛てなので -o は指定できません".into());
-            }
-            return Ok(Target::Dnat { addr: Ipv4Addr::LOCALHOST.into(), port: Some(port), oif: None });
-        }
-        _ if to.is_some() => return Err(format!("{name} に --to-destination / --to-ports は指定できません")),
-        _ => {}
-    }
-    match (name, oif) {
-        ("ROUTE" | "ACCEPT", Some(i)) => Ok(Target::Route(i)),
-        ("ROUTE", None) => Err("ROUTE には -o インターフェースが必要です".into()),
-        ("ACCEPT", None) => Ok(Target::Accept),
-        ("DROP", None) => Ok(Target::Drop),
-        ("REJECT", None) => Ok(Target::Reject),
-        ("DROP" | "REJECT", Some(_)) => Err(format!("{name} に -o は指定できません")),
-        (t, _) => Err(format!("不明なターゲット: {t}")),
-    }
-}
-
 pub const SAMPLE: &str = r#"# win-iptables ルール
 # 書式は iptables 風。上から順に評価され、最初にマッチしたルールが適用されます。
 #
@@ -580,8 +311,9 @@ pub const SAMPLE: &str = r#"# win-iptables ルール
 #
 # 条件: -p tcp|udp|icmp  -s CIDR[,CIDR]  -d CIDR[,CIDR]  --dport 80,443,8000:8080
 #       -m owner --process chrome.exe,msedge*   （各条件の前に ! で否定）
-#       -s は送信元。この PC のアプリは TUN のアドレス、ICS などで転送されてきた通信は元の端末のアドレス
+#       -s は送信元。この PC のアプリとホットスポットの端末は TUN のアドレスとして見える
 # インターフェース名は「インターフェース」タブの名前（空白を含む場合は "..." で囲む）
+# 右側の「例と書き方」から、用途別のルールをボタンひとつで追加できます
 
 -P OUTPUT ACCEPT
 
@@ -602,6 +334,7 @@ pub const SAMPLE: &str = r#"# win-iptables ルール
 
 #[cfg(test)]
 mod tests {
+    use super::parser::tokenize;
     use super::*;
 
     fn flow<'a>(proto: Proto, dst: &str, dport: u16, process: Option<&'a str>) -> Flow<'a> {
@@ -637,10 +370,7 @@ mod tests {
 
     #[test]
     fn negation_and_insert() {
-        let rs = parse(
-            "-A OUTPUT ! -d 192.168.0.0/16 -j REJECT\n-I OUTPUT ! -m owner --process chrome* -p tcp -j DROP",
-        )
-        .unwrap();
+        let rs = parse("-A OUTPUT ! -d 192.168.0.0/16 -j REJECT\n-I OUTPUT ! -m owner --process chrome* -p tcp -j DROP").unwrap();
         assert_eq!(rs.rules[0].line, 2);
         assert_eq!(*rs.evaluate(&flow(Proto::Tcp, "192.168.1.1", 1, None)).target, Target::Drop);
         assert_eq!(*rs.evaluate(&flow(Proto::Tcp, "8.8.8.8", 1, Some("chrome.exe"))).target, Target::Reject);
@@ -685,6 +415,7 @@ mod tests {
         assert_eq!(v6.to_string(), "DNAT ::1 -o \"eth\"");
         assert_eq!(rs.policy.dnat_dest(1), Some("192.0.2.1:3128".parse().unwrap()));
         assert_eq!(rs.referenced_interfaces(), vec!["eth"]);
+        assert_eq!(rs.local_dnat_ports(), vec![8080]);
 
         assert!(parse("-A OUTPUT -j REDIRECT").is_err());
         assert!(parse("-A OUTPUT -j REDIRECT --to-ports 1:2").is_err());
@@ -733,7 +464,7 @@ mod tests {
 
     #[test]
     fn hotspot_clients_to_transparent_proxy() {
-        // README の「モバイル ホットスポットの端末の通信を扱う」の例
+        // 端末の元のアドレスのまま転送されてくる構成（ICS の NAT を通らない）の例
         let rs = parse(
             "-A OUTPUT -s 192.168.137.0/24 -p udp --dport 443 -j DROP\n\
              -A OUTPUT -s 192.168.137.0/24 -p tcp --dport 80,443 -j REDIRECT --to-ports 8080",
@@ -754,9 +485,22 @@ mod tests {
     }
 
     #[test]
+    fn negated_wildcard_process_selects_flows_without_a_process() {
+        // ホットスポットの端末の通信は PC 上のプロセスが見つからない
+        let rs = parse("-A OUTPUT ! -m owner --process * -j DROP").unwrap();
+        assert_eq!(*rs.evaluate(&flow(Proto::Tcp, "8.8.8.8", 443, None)).target, Target::Drop);
+        assert_eq!(*rs.evaluate(&flow(Proto::Tcp, "8.8.8.8", 443, Some("chrome.exe"))).target, Target::Accept);
+        let unknown = Flow { process: Owner::Unknown, ..flow(Proto::Tcp, "8.8.8.8", 443, None) };
+        assert!(rs.evaluate_with(&unknown, |_| Some(true)).is_none(), "プロセスを引いてから判定する");
+    }
+
+    #[test]
     fn source_address() {
-        let rs = parse("-A OUTPUT -s 192.168.137.0/24,fd00::/8 -j ROUTE -o eth
--A OUTPUT ! -s 10.233.0.2 -j DROP").unwrap();
+        let rs = parse(
+            "-A OUTPUT -s 192.168.137.0/24,fd00::/8 -j ROUTE -o eth
+-A OUTPUT ! -s 10.233.0.2 -j DROP",
+        )
+        .unwrap();
         let from = |src: &str| Flow {
             proto: Proto::Tcp,
             src: src.parse().unwrap(),

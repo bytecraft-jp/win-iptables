@@ -30,6 +30,14 @@ windows-sys = { version = "0.61.2", features = [
 ] }
 arc-swap = "1.9.2"
 raw-window-handle = "0.6"
+windows = { version = "0.62.2", features = [
+    "Networking_Connectivity",
+    "Networking_NetworkOperators",
+    "Win32_NetworkManagement_WindowsFirewall",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+] }
 
 [profile.release]
 opt-level = 3

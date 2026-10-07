@@ -9,9 +9,11 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
+use arc_swap::ArcSwapOption;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use wintun_bindings::Session;
@@ -24,16 +26,24 @@ const RX_QUEUE: usize = 4096;
 /// そのままだと Windows が MTU 1500 の LAN 側へ転送できずに捨て、大きな応答が届かない
 const FORWARD_MTU: usize = 1500;
 
+/// 送信に使うセッション。停止時に空にすると、IP スタック側の後片付けが済んでいなくても
+/// セッション（とアダプタ）を閉じられる。空の間に書かれたパケットは捨てる
+pub type SessionSlot = Arc<ArcSwapOption<Session>>;
+
 pub struct TunDevice {
-    session: Arc<Session>,
+    session: SessionSlot,
     rx: mpsc::Receiver<Vec<u8>>,
     mtu: usize,
     /// TUN 自身のアドレス。これ以外が宛先のパケットは Windows が他の端末へ転送する
     local: Vec<IpAddr>,
+    /// true の間は宛先によらず分け直す。TUN を共有元にしたホットスポットでは、端末宛てのパケットも
+    /// 共有の NAT を戻す前は TUN 自身宛てに見えるため、宛先では見分けられない
+    split_all: Arc<AtomicBool>,
 }
 
 impl TunDevice {
-    pub fn new(session: Arc<Session>, mtu: usize, local: Vec<IpAddr>) -> (Self, JoinHandle<()>) {
+    /// 戻り値の [`SessionSlot`] は停止時に空にする
+    pub fn new(session: Arc<Session>, mtu: usize, local: Vec<IpAddr>, split_all: Arc<AtomicBool>) -> (Self, JoinHandle<()>, SessionSlot) {
         let (tx, rx) = mpsc::channel(RX_QUEUE);
         let reader = session.clone();
         let handle = std::thread::Builder::new()
@@ -47,14 +57,17 @@ impl TunDevice {
                 }
             })
             .expect("spawn wintun-rx");
-        (Self { session, rx, mtu, local }, handle)
+        let slot: SessionSlot = Arc::new(ArcSwapOption::from(Some(session)));
+        (Self { session: slot.clone(), rx, mtu, local, split_all }, handle, slot)
     }
 
     fn send(&self, buf: &[u8]) {
+        let session = self.session.load();
+        let Some(session) = session.as_ref() else { return };
         // 送信リングが満杯なら NIC と同じくパケットを落とす（TCP は再送で回復する）
-        if let Ok(mut pkt) = self.session.allocate_send_packet(buf.len() as u16) {
+        if let Ok(mut pkt) = session.allocate_send_packet(buf.len() as u16) {
             pkt.bytes_mut().copy_from_slice(buf);
-            self.session.send_packet(pkt);
+            session.send_packet(pkt);
         }
     }
 }
@@ -80,7 +93,7 @@ impl AsyncWrite for TunDevice {
     fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         // ipstack は 1 回の書き込みで 1 パケットを渡す
         if buf.len() > FORWARD_MTU
-            && dst_of(buf).is_some_and(|d| !self.local.contains(&d))
+            && (self.split_all.load(Ordering::Relaxed) || dst_of(buf).is_some_and(|d| !self.local.contains(&d)))
             && let Some(parts) = split_for_forward(buf)
         {
             for p in &parts {
@@ -200,11 +213,8 @@ mod tests {
 
     fn big_tcp(v4: bool, len: usize, fin: bool) -> Vec<u8> {
         let payload: Vec<u8> = (0..len).map(|i| i as u8).collect();
-        let b = if v4 {
-            PacketBuilder::ipv4([8, 8, 8, 8], [192, 168, 137, 50], 64)
-        } else {
-            PacketBuilder::ipv6([0x20; 16], [0xfd; 16], 64)
-        };
+        let b =
+            if v4 { PacketBuilder::ipv4([8, 8, 8, 8], [192, 168, 137, 50], 64) } else { PacketBuilder::ipv6([0x20; 16], [0xfd; 16], 64) };
         let mut b = b.tcp(443, 50000, 0xffff_fff0, 65535).ack(1234).psh();
         if fin {
             b = b.fin();

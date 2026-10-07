@@ -9,7 +9,7 @@ use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS, WIN32
 use windows_sys::Win32::NetworkManagement::IpHelper::*;
 use windows_sys::Win32::NetworkManagement::Ndis::{IfOperStatusUp, NET_LUID_LH};
 use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, AF_INET6, AF_UNSPEC, IN6_ADDR, IN_ADDR, IPPROTO_IP, IPPROTO_IPV6, IPV6_UNICAST_IF, IP_UNICAST_IF,
+    AF_INET, AF_INET6, AF_UNSPEC, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0, IP_UNICAST_IF, IPPROTO_IP, IPPROTO_IPV6, IPV6_UNICAST_IF,
     MIB_IPPROTO_NETMGMT, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET, SOCKET, setsockopt,
 };
 
@@ -17,6 +17,8 @@ const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
 
 #[derive(Debug, Clone)]
 pub struct Iface {
+    /// `{XXXXXXXX-...}` 形式のアダプタ GUID
+    pub guid: String,
     pub name: String,
     pub description: String,
     pub index: u32,
@@ -27,14 +29,22 @@ pub struct Iface {
     pub gateways: Vec<IpAddr>,
 }
 
+/// ログやメッセージ用のアドレスファミリ名
+pub fn family(v6: bool) -> &'static str {
+    if v6 { "IPv6" } else { "IPv4" }
+}
+
+/// リンクローカルアドレスか（送信元として外へは出せない）
+pub fn is_link_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(a) => a.is_link_local(),
+        IpAddr::V6(a) => a.is_unicast_link_local(),
+    }
+}
+
 impl Iface {
     pub fn first_addr(&self, v6: bool) -> Option<IpAddr> {
-        let usable = |a: &IpAddr| match a {
-            IpAddr::V4(a) => !v6 && !a.is_link_local(),
-            // リンクローカルは送信元として使えないので除外
-            IpAddr::V6(a) => v6 && !a.is_unicast_link_local(),
-        };
-        self.addrs.iter().map(|(a, _)| *a).find(usable)
+        self.addrs.iter().map(|(a, _)| *a).find(|a| a.is_ipv6() == v6 && !is_link_local(*a))
     }
 
     pub fn gateway(&self, v6: bool) -> Option<IpAddr> {
@@ -68,6 +78,22 @@ unsafe fn wstr(p: *const u16) -> String {
         n += 1;
     }
     String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, n) })
+}
+
+/// NULL 終端の連結リストをたどる。`p` から先の要素は `'a` の間有効でなければならない
+unsafe fn walk<'a, T: 'a>(mut p: *mut T, next: impl Fn(&T) -> *mut T) -> impl Iterator<Item = &'a T> {
+    std::iter::from_fn(move || {
+        let cur = unsafe { p.as_ref()? };
+        p = next(cur);
+        Some(cur)
+    })
+}
+
+unsafe fn cstr(p: *const u8) -> String {
+    if p.is_null() {
+        return String::new();
+    }
+    unsafe { std::ffi::CStr::from_ptr(p.cast()) }.to_string_lossy().into_owned()
 }
 
 unsafe fn from_sockaddr(sa: *const SOCKADDR) -> Option<IpAddr> {
@@ -106,14 +132,14 @@ fn to_inet(ip: IpAddr) -> SOCKADDR_INET {
             sa.Ipv4 = SOCKADDR_IN {
                 sin_family: AF_INET,
                 sin_port: 0,
-                sin_addr: IN_ADDR { S_un: unsafe { std::mem::transmute::<[u8; 4], _>(a.octets()) } },
+                sin_addr: IN_ADDR { S_un: IN_ADDR_0 { S_addr: u32::from_ne_bytes(a.octets()) } },
                 sin_zero: [0; 8],
             };
         }
-        IpAddr::V6(a) => unsafe {
+        IpAddr::V6(a) => {
             sa.Ipv6.sin6_family = AF_INET6;
-            sa.Ipv6.sin6_addr = IN6_ADDR { u: std::mem::transmute::<[u8; 16], _>(a.octets()) };
-        },
+            sa.Ipv6.sin6_addr = IN6_ADDR { u: IN6_ADDR_0 { Byte: a.octets() } };
+        }
     }
     sa
 }
@@ -132,41 +158,29 @@ pub fn list_interfaces() -> io::Result<Vec<Iface>> {
         check(r)?;
         break;
     }
-    let mut out = Vec::new();
-    let mut p = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
-    while !p.is_null() {
-        let a = unsafe { &*p };
-        let mut addrs = Vec::new();
-        let mut u = a.FirstUnicastAddress;
-        while !u.is_null() {
-            let ua = unsafe { &*u };
-            if let Some(ip) = unsafe { from_sockaddr(ua.Address.lpSockaddr) } {
-                addrs.push((ip, ua.OnLinkPrefixLength));
+    // buf はこの関数の終わりまで生きているので、リストの各要素も有効
+    let adapters = unsafe { walk(buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH, |a| a.Next) };
+    let out = adapters
+        .map(|a| {
+            let addrs = unsafe { walk(a.FirstUnicastAddress, |u| u.Next) }
+                .filter_map(|u| Some((unsafe { from_sockaddr(u.Address.lpSockaddr) }?, u.OnLinkPrefixLength)))
+                .collect();
+            let gateways =
+                unsafe { walk(a.FirstGatewayAddress, |g| g.Next) }.filter_map(|g| unsafe { from_sockaddr(g.Address.lpSockaddr) }).collect();
+            let index = unsafe { a.Anonymous1.Anonymous.IfIndex };
+            Iface {
+                guid: unsafe { cstr(a.AdapterName) },
+                name: unsafe { wstr(a.FriendlyName) },
+                description: unsafe { wstr(a.Description) },
+                index: if index != 0 { index } else { a.Ipv6IfIndex },
+                luid: unsafe { a.Luid.Value },
+                up: a.OperStatus == IfOperStatusUp,
+                loopback: a.IfType == IF_TYPE_SOFTWARE_LOOPBACK,
+                addrs,
+                gateways,
             }
-            u = ua.Next;
-        }
-        let mut gateways = Vec::new();
-        let mut g = a.FirstGatewayAddress;
-        while !g.is_null() {
-            let ga = unsafe { &*g };
-            if let Some(ip) = unsafe { from_sockaddr(ga.Address.lpSockaddr) } {
-                gateways.push(ip);
-            }
-            g = ga.Next;
-        }
-        let index = unsafe { a.Anonymous1.Anonymous.IfIndex };
-        out.push(Iface {
-            name: unsafe { wstr(a.FriendlyName) },
-            description: unsafe { wstr(a.Description) },
-            index: if index != 0 { index } else { a.Ipv6IfIndex },
-            luid: unsafe { a.Luid.Value },
-            up: a.OperStatus == IfOperStatusUp,
-            loopback: a.IfType == IF_TYPE_SOFTWARE_LOOPBACK,
-            addrs,
-            gateways,
-        });
-        p = a.Next;
-    }
+        })
+        .collect();
     Ok(out)
 }
 
@@ -175,9 +189,7 @@ pub fn find_iface<'a>(ifs: &'a [Iface], key: &str) -> Option<&'a Iface> {
     if let Some(idx) = key.strip_prefix('#').and_then(|s| s.parse::<u32>().ok()) {
         return ifs.iter().find(|i| i.index == idx);
     }
-    ifs.iter()
-        .find(|i| i.name.eq_ignore_ascii_case(key))
-        .or_else(|| ifs.iter().find(|i| i.description.eq_ignore_ascii_case(key)))
+    ifs.iter().find(|i| i.name.eq_ignore_ascii_case(key)).or_else(|| ifs.iter().find(|i| i.description.eq_ignore_ascii_case(key)))
 }
 
 pub fn list_routes() -> io::Result<Vec<Route>> {
@@ -240,12 +252,7 @@ pub fn add_address(if_luid: u64, addr: IpAddr, prefix: u8) -> io::Result<()> {
 }
 
 pub fn interface_metric(if_luid: u64, v6: bool) -> Option<u32> {
-    let mut row: MIB_IPINTERFACE_ROW = unsafe { std::mem::zeroed() };
-    unsafe { InitializeIpInterfaceEntry(&mut row) };
-    row.Family = if v6 { AF_INET6 } else { AF_INET };
-    row.InterfaceLuid = luid(if_luid);
-    check(unsafe { GetIpInterfaceEntry(&mut row) }).ok()?;
-    Some(row.Metric)
+    ip_interface_row(if_luid, v6).ok().map(|row| row.Metric)
 }
 
 /// `if_luid` の NIC から `dst` へ送るときに Windows が選ぶ送信元アドレス（RFC 6724。IPv6 なら一時アドレスを優先）
@@ -259,14 +266,26 @@ pub fn best_source(if_luid: u64, dst: IpAddr) -> Option<IpAddr> {
     (!ip.is_unspecified()).then_some(ip)
 }
 
-/// インターフェースの IP 転送を有効にする（受信したインターフェースで転送が有効でないと Windows は転送しない）
-pub fn enable_forwarding(if_luid: u64, v6: bool) -> io::Result<()> {
+fn ip_interface_row(if_luid: u64, v6: bool) -> io::Result<MIB_IPINTERFACE_ROW> {
     let mut row: MIB_IPINTERFACE_ROW = unsafe { std::mem::zeroed() };
     unsafe { InitializeIpInterfaceEntry(&mut row) };
     row.Family = if v6 { AF_INET6 } else { AF_INET };
     row.InterfaceLuid = luid(if_luid);
     check(unsafe { GetIpInterfaceEntry(&mut row) })?;
-    row.ForwardingEnabled = true;
+    Ok(row)
+}
+
+/// インターフェースで IP 転送が有効か（そのファミリが無効な NIC なら None）
+pub fn forwarding_enabled(if_luid: u64, v6: bool) -> Option<bool> {
+    ip_interface_row(if_luid, v6).ok().map(|r| r.ForwardingEnabled)
+}
+
+/// インターフェースの IP 転送を切り替える（受信したインターフェースで転送が有効でないと Windows は転送しない）。
+/// 転送が有効な NIC は「ルーター」扱いになり、その NIC のアドレスを送信元にしたパケットも宛先の経路だけで
+/// 送出先が決まる（bind や IP_UNICAST_IF で NIC を固定しても効かない）
+pub fn set_forwarding(if_luid: u64, v6: bool, enabled: bool) -> io::Result<()> {
+    let mut row = ip_interface_row(if_luid, v6)?;
+    row.ForwardingEnabled = enabled;
     // IPv4 では SitePrefixLength を 0 にしないと SetIpInterfaceEntry が失敗する
     if !v6 {
         row.SitePrefixLength = 0;
@@ -285,11 +304,7 @@ pub fn best_default_route(routes: &[Route], exclude_luid: u64, v6: bool) -> Opti
 /// ソケットの送出インターフェースを固定する（ルーティングテーブルの最長一致より優先される）
 pub fn set_unicast_if(sock: SOCKET, if_index: u32, v6: bool) -> io::Result<()> {
     // IPv4 はネットワークバイトオーダー、IPv6 はホストバイトオーダーで渡す仕様
-    let (level, opt, val) = if v6 {
-        (IPPROTO_IPV6, IPV6_UNICAST_IF, if_index)
-    } else {
-        (IPPROTO_IP, IP_UNICAST_IF, if_index.to_be())
-    };
+    let (level, opt, val) = if v6 { (IPPROTO_IPV6, IPV6_UNICAST_IF, if_index) } else { (IPPROTO_IP, IP_UNICAST_IF, if_index.to_be()) };
     let r = unsafe { setsockopt(sock, level, opt, ptr::addr_of!(val).cast(), 4) };
     if r == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
@@ -297,6 +312,26 @@ pub fn set_unicast_if(sock: SOCKET, if_index: u32, v6: bool) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn address_conversion_preserves_network_bytes() {
+        for text in ["0.0.0.0", "192.0.2.129", "255.255.255.255", "::", "::1", "2001:db8:1234::abcd"] {
+            let ip: IpAddr = text.parse().unwrap();
+            let inet = to_inet(ip);
+            assert_eq!(from_inet(&inet), ip);
+            let bytes: &[u8] = unsafe {
+                match ip {
+                    IpAddr::V4(_) => std::slice::from_raw_parts(std::ptr::addr_of!(inet.Ipv4.sin_addr).cast(), 4),
+                    IpAddr::V6(_) => &inet.Ipv6.sin6_addr.u.Byte,
+                }
+            };
+            let expected = match ip {
+                IpAddr::V4(ip) => ip.octets().to_vec(),
+                IpAddr::V6(ip) => ip.octets().to_vec(),
+            };
+            assert_eq!(bytes, expected);
+        }
+    }
 
     #[test]
     fn enumerates_interfaces_and_routes() {
