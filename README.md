@@ -44,7 +44,7 @@ IP_UNICAST_IF で送出NICを固定したソケットから再接続 → 物理N
 
 ```powershell
 cargo build --release
-pwsh scripts/fetch-wintun.ps1      # wintun.dll を取得し target/{debug,release} に配置（SHA256 検証付き）
+pwsh scripts/fetch-wintun.ps1      # wintun.dll を取得し vendor/ と target/{debug,release}/ に配置（SHA256 検証付き）
 target\release\win-iptables.exe
 ```
 
@@ -93,6 +93,8 @@ target\release\win-iptables.exe
 | `-j DNAT --to-destination ADDR[:PORT] [-o IF]` | 宛先を書き換えて転送。ポート省略で元のポート、`-o` 省略で OS の経路表に従う（IPv6 は `[::1]:8080`） |
 | `-A BYPASS` | TUN を通さず、OS の経路表に直接経路を入れる（社内網・大容量通信向け）。Stop で削除 |
 
+インターフェース名は名前・説明（例: `Intel(R) Wi-Fi 6E AX211 160MHz`）・`#インデックス` のいずれでも指定できます。
+
 ### ローカルのプロキシへ転送する
 
 ```text
@@ -101,9 +103,7 @@ target\release\win-iptables.exe
 ```
 
 - 転送先がこの PC 上のアドレスのとき、そのポートで待ち受けているプロセス自身の通信にはルールを適用しません（プロキシの上流接続が自分に戻ってくるループを防ぐ）
-- 転送先には CONNECT ではなく生の HTTP/TLS がそのまま届きます。透過モードで受けられるプロキシを使ってください（例: Burp の invisible proxying、mitmproxy の `--mode reverse:` / `transparent` 相当の設定）。Windows には元の宛先を取り出す API（Linux の `SO_ORIGINAL_DST`）がないので、プロキシ側は Host ヘッダや TLS の SNI で宛先を判断します
-
-インターフェース名は名前・説明（例: `Intel(R) Wi-Fi 6E AX211 160MHz`）・`#インデックス` のいずれでも指定できます。
+- 転送先には CONNECT ではなく生の HTTP/TLS がそのまま届きます。透過モードで受けられるプロキシを使ってください。Windows には元の宛先を取り出す API（Linux の `SO_ORIGINAL_DST`）がないので、プロキシ側は Host ヘッダや TLS の SNI で宛先を判断します
 
 ### モバイル ホットスポットの端末の通信を扱う
 
@@ -139,8 +139,6 @@ target\release\win-iptables.exe
 
 ## 開発
 
-アイコンは `scripts/make-icon.py`（Pillow が必要）で `assets/icon.ico` / `icon.png` を生成し、`build.rs` で exe に埋め込んでいます。図柄を変えたらスクリプトを実行し直してからビルドしてください。`assets/icon-preview.png` は全サイズを並べた確認用の画像です。
-
 ```powershell
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
@@ -166,3 +164,9 @@ cargo test   # 設定・ルール・接続状態・ローカル TCP/UDP・Window
 | `src/ics.rs` / `src/ics/native.rs` | 手動で TUN を共有していた場合の停止時の解除 / Windows ICS COM API |
 
 通常のテストでは TUN の作成や実際の経路・共有設定の変更は行いません。共有元の切替・失敗時の巻き戻し・停止時の復元は模擬 API で検証します。管理者専用の読み取りテストは `cargo test native_enumeration_finds_connections -- --ignored --nocapture` で実行できます。全捕捉・BYPASS・ホットスポットを含む開始／停止と端末の通信は、管理者権限で別途確認してください。
+
+## ライセンス
+
+[MIT License](LICENSE)
+
+同梱して配布する `wintun.dll` はこのライセンスの対象外です。WireGuard LLC の Prebuilt Binaries License に従います（[wintun.net](https://www.wintun.net/)）。

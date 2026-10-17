@@ -3,6 +3,7 @@ name = "win-iptables"
 version = "0.1.0"
 edition = "2024"
 description = "Windows native lightweight user-mode router (Wintun + iptables-style rules)"
+license = "MIT"
 
 [dependencies]
 anyhow = "1.0.104"
